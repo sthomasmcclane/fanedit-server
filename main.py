@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import os
 import re
@@ -9,18 +10,21 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, AsyncIterator, Optional
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
+import pychromecast
+from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 _raw_roots = os.environ.get("MEDIA_ROOTS") or os.environ.get("MEDIA_ROOT", "/data/fanedits")
 MEDIA_ROOTS = [Path(p.strip()).resolve() for p in _raw_roots.split(",") if p.strip()]
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".m4v", ".webm"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 BROWSER_PLAYABLE_EXTS = {".mp4", ".m4v", ".webm", ".mkv"}
+LAN_HOST = os.environ.get("LAN_HOST", "192.168.1.10")
 
 app = FastAPI(title="FanMedia")
+_CAST_CACHE: dict[str, Any] = {}
 
 
 @dataclass
@@ -539,10 +543,11 @@ def watch(rel_path: str) -> HTMLResponse:
     if video.suffix.lower() in BROWSER_PLAYABLE_EXTS:
         player_html = f'<video controls preload="metadata"{poster_attr}><source src="{stream_url}"></video>'
     else:
+        transcode_url = f"/transcode/{_url_path(clean)}"
         player_html = (
-            '<div class="notice">This file format '
-            f"({html.escape(video.suffix)}) isn't natively playable in most browsers. "
-            "Use <strong>Open in VLC (.m3u)</strong> or <strong>Download</strong> on the right.</div>"
+            f'<video controls preload="none"{poster_attr}>'
+            f'<source src="{transcode_url}" type="video/mp4">'
+            "</video>"
         )
 
     pills: list[str] = []
@@ -565,9 +570,45 @@ def watch(rel_path: str) -> HTMLResponse:
         f'<div class="pills">{"".join(pills)}</div>'
         f"{plot_html}"
         '<div class="actions">'
-        f'<a class="btn" href="/playlist/{_url_path(clean)}">Open in VLC (.m3u)</a>'
         f'<a class="btn secondary" href="{stream_url}" download>Download</a>'
-        "</div></div>"
+        "</div>"
+        '<div style="margin-top:1.25rem;padding-top:1rem;border-top:1px solid var(--border);">'
+        '<div style="font-size:0.85rem;color:var(--muted);margin-bottom:0.5rem;">Cast to TV / Chromecast</div>'
+        '<div style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center;">'
+        '<select id="cast-device" style="flex:1;min-width:160px;background:#232936;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:0.45rem;">'
+        '<option value="">Scanning LAN...</option></select>'
+        '<button class="btn" type="button" onclick="castPlay()">Cast</button>'
+        '<button class="btn secondary" type="button" onclick="castCtrl(\'pause\')">Pause</button>'
+        '<button class="btn secondary" type="button" onclick="castCtrl(\'stop\')">Stop</button>'
+        "</div>"
+        '<div id="cast-status" style="font-size:0.8rem;color:var(--muted);margin-top:0.4rem;"></div>'
+        "</div>"
+        "<script>"
+        f"const MEDIA_PATH = {urllib.parse.quote(clean)!r};"
+        "async function loadCastDevices(){"
+        "const sel=document.getElementById('cast-device');"
+        "try{const r=await fetch('/api/cast/devices');const devs=await r.json();"
+        "if(!devs.length){sel.innerHTML='<option value=\"\">No Cast devices found</option>';return;}"
+        "sel.innerHTML=devs.map(d=>`<option value=\"${d.uuid}\">${d.name} (${d.model})</option>`).join('');"
+        "}catch(e){sel.innerHTML='<option value=\"\">Discovery failed</option>';}}"
+        "async function castPlay(){"
+        "const uuid=document.getElementById('cast-device').value;"
+        "const st=document.getElementById('cast-status');"
+        "if(!uuid){st.textContent='Select a device first.';return;}"
+        "st.textContent='Connecting...';"
+        "const r=await fetch('/api/cast/play',{method:'POST',headers:{'Content-Type':'application/json'},"
+        "body:JSON.stringify({uuid,path:decodeURIComponent(MEDIA_PATH)})});"
+        "const j=await r.json();st.textContent=j.message||j.detail||'Done';}"
+        "async function castCtrl(action){"
+        "const uuid=document.getElementById('cast-device').value;"
+        "const st=document.getElementById('cast-status');"
+        "if(!uuid)return;"
+        "const r=await fetch('/api/cast/control',{method:'POST',headers:{'Content-Type':'application/json'},"
+        "body:JSON.stringify({uuid,action})});"
+        "const j=await r.json();st.textContent=j.message||j.detail||'Done';}"
+        "loadCastDevices();"
+        "</script>"
+        "</div>"
     )
 
     parent_rel = _rel_from(root, video.parent)
@@ -581,6 +622,142 @@ def stream(rel_path: str) -> FileResponse:
     if video.suffix.lower() not in VIDEO_EXTS:
         raise HTTPException(status_code=404, detail="Video not found")
     return FileResponse(video)
+
+
+@app.get("/transcode/{rel_path:path}")
+async def transcode(rel_path: str) -> StreamingResponse:
+    _, video = _resolve_file(rel_path)
+    if video.suffix.lower() not in VIDEO_EXTS:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "22",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ac",
+        "2",
+        "-movflags",
+        "frag_keyframe+empty_moov+default_base_moof",
+        "-f",
+        "mp4",
+        "pipe:1",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    async def stream_chunks() -> AsyncIterator[bytes]:
+        assert proc.stdout is not None
+        try:
+            while True:
+                chunk = await proc.stdout.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            if proc.returncode is None:
+                proc.kill()
+            await proc.wait()
+
+    return StreamingResponse(stream_chunks(), media_type="video/mp4")
+
+
+def _discover_casts() -> list[dict[str, str]]:
+    chromecasts, browser = pychromecast.get_chromecasts(timeout=3)
+    pychromecast.discovery.stop_discovery(browser)
+    _CAST_CACHE.clear()
+    out: list[dict[str, str]] = []
+    for cc in chromecasts:
+        uid = str(cc.uuid)
+        _CAST_CACHE[uid] = cc
+        out.append({"uuid": uid, "name": cc.name, "model": cc.model_name})
+    return sorted(out, key=lambda d: d["name"].lower())
+
+
+def _lan_base(request: Request) -> str:
+    host = request.url.hostname or LAN_HOST
+    if host in ("127.0.0.1", "localhost", "0.0.0.0"):
+        host = LAN_HOST
+    port = request.url.port or 8090
+    return f"http://{host}:{port}"
+
+
+@app.get("/api/cast/devices", response_class=JSONResponse)
+async def cast_devices() -> list[dict[str, str]]:
+    return await asyncio.to_thread(_discover_casts)
+
+
+@app.post("/api/cast/play", response_class=JSONResponse)
+async def cast_play(request: Request, payload: dict[str, str] = Body(...)) -> dict[str, str]:
+    uuid = payload.get("uuid", "")
+    rel_path = payload.get("path", "")
+    root, video = _resolve_file(rel_path)
+    if video.suffix.lower() not in VIDEO_EXTS:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    cc = _CAST_CACHE.get(uuid)
+    if cc is None:
+        await asyncio.to_thread(_discover_casts)
+        cc = _CAST_CACHE.get(uuid)
+    if cc is None:
+        raise HTTPException(status_code=404, detail="Cast device not found")
+
+    clean = _rel_from(root, video)
+    nfo = _parse_nfo(video.with_suffix(".nfo"))
+    title = nfo.title or video.stem
+    art = _find_video_art(root, video)
+    base = _lan_base(request)
+    thumb = f"{base}/art/{_url_path(_rel_from(root, art))}" if art else None
+
+    if video.suffix.lower() in BROWSER_PLAYABLE_EXTS:
+        media_url = f"{base}/stream/{_url_path(clean)}"
+    else:
+        media_url = f"{base}/transcode/{_url_path(clean)}"
+
+    def _start() -> None:
+        cc.wait(timeout=5)
+        mc = cc.media_controller
+        mc.play_media(media_url, "video/mp4", title=title, thumb=thumb)
+        mc.block_until_active(timeout=5)
+
+    await asyncio.to_thread(_start)
+    return {"message": f"Casting '{title}' to {cc.name}"}
+
+
+@app.post("/api/cast/control", response_class=JSONResponse)
+async def cast_control(payload: dict[str, str] = Body(...)) -> dict[str, str]:
+    uuid = payload.get("uuid", "")
+    action = payload.get("action", "")
+    cc = _CAST_CACHE.get(uuid)
+    if cc is None:
+        raise HTTPException(status_code=404, detail="Cast device not found")
+
+    def _run() -> None:
+        cc.wait(timeout=5)
+        mc = cc.media_controller
+        if action == "pause":
+            mc.pause()
+        elif action == "play":
+            mc.play()
+        elif action == "stop":
+            mc.stop()
+
+    await asyncio.to_thread(_run)
+    return {"message": f"Sent '{action}' to {cc.name}"}
 
 
 @app.get("/art/{rel_path:path}")
