@@ -11,10 +11,11 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
+from uuid import UUID
 
 import pychromecast
 from fastapi import Body, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 _raw_roots = os.environ.get("MEDIA_ROOTS") or os.environ.get("MEDIA_ROOT", "/data/fanedits")
 MEDIA_ROOTS = [Path(p.strip()).resolve() for p in _raw_roots.split(",") if p.strip()]
@@ -199,6 +200,7 @@ def _page_shell(title: str, breadcrumbs_html: str, body_html: str) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <title>{html.escape(title)} — FanMedia</title>
   <style>
     :root {{
@@ -432,6 +434,21 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+_FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+    '<rect width="64" height="64" rx="14" fill="#0f1115"/>'
+    '<rect x="4" y="4" width="56" height="56" rx="11" fill="none" stroke="#e5a00d" stroke-width="4"/>'
+    '<polygon points="25,19 25,45 47,32" fill="#e5a00d"/>'
+    '</svg>'
+)
+
+
+@app.get("/favicon.svg")
+@app.get("/favicon.ico")
+def favicon() -> Response:
+    return Response(content=_FAVICON_SVG, media_type="image/svg+xml")
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
     return browse("")
@@ -596,16 +613,18 @@ def watch(rel_path: str) -> HTMLResponse:
         "const st=document.getElementById('cast-status');"
         "if(!uuid){st.textContent='Select a device first.';return;}"
         "st.textContent='Connecting...';"
-        "const r=await fetch('/api/cast/play',{method:'POST',headers:{'Content-Type':'application/json'},"
+        "try{const r=await fetch('/api/cast/play',{method:'POST',headers:{'Content-Type':'application/json'},"
         "body:JSON.stringify({uuid,path:decodeURIComponent(MEDIA_PATH)})});"
-        "const j=await r.json();st.textContent=j.message||j.detail||'Done';}"
+        "const j=await r.json();st.textContent=j.message||j.detail||('HTTP '+r.status);"
+        "}catch(e){st.textContent='Cast error: '+e;}}"
         "async function castCtrl(action){"
         "const uuid=document.getElementById('cast-device').value;"
         "const st=document.getElementById('cast-status');"
         "if(!uuid)return;"
-        "const r=await fetch('/api/cast/control',{method:'POST',headers:{'Content-Type':'application/json'},"
+        "try{const r=await fetch('/api/cast/control',{method:'POST',headers:{'Content-Type':'application/json'},"
         "body:JSON.stringify({uuid,action})});"
-        "const j=await r.json();st.textContent=j.message||j.detail||'Done';}"
+        "const j=await r.json();st.textContent=j.message||j.detail||('HTTP '+r.status);"
+        "}catch(e){st.textContent='Control error: '+e;}}"
         "loadCastDevices();"
         "</script>"
         "</div>"
@@ -703,18 +722,16 @@ async def cast_devices() -> list[dict[str, str]]:
 
 @app.post("/api/cast/play", response_class=JSONResponse)
 async def cast_play(request: Request, payload: dict[str, str] = Body(...)) -> dict[str, str]:
-    uuid = payload.get("uuid", "")
+    uuid_str = payload.get("uuid", "")
     rel_path = payload.get("path", "")
     root, video = _resolve_file(rel_path)
     if video.suffix.lower() not in VIDEO_EXTS:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    cc = _CAST_CACHE.get(uuid)
-    if cc is None:
-        await asyncio.to_thread(_discover_casts)
-        cc = _CAST_CACHE.get(uuid)
-    if cc is None:
-        raise HTTPException(status_code=404, detail="Cast device not found")
+    try:
+        target_uuid = UUID(uuid_str)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid device UUID")
 
     clean = _rel_from(root, video)
     nfo = _parse_nfo(video.with_suffix(".nfo"))
@@ -728,36 +745,65 @@ async def cast_play(request: Request, payload: dict[str, str] = Body(...)) -> di
     else:
         media_url = f"{base}/transcode/{_url_path(clean)}"
 
-    def _start() -> None:
-        cc.wait(timeout=5)
-        mc = cc.media_controller
-        mc.play_media(media_url, "video/mp4", title=title, thumb=thumb)
-        mc.block_until_active(timeout=5)
+    def _start() -> str:
+        casts, browser = pychromecast.get_listed_chromecasts(uuids=[target_uuid], discovery_timeout=5)
+        try:
+            if not casts:
+                raise HTTPException(status_code=404, detail="Cast device not found on LAN")
+            cc = casts[0]
+            _CAST_CACHE[uuid_str] = cc
+            cc.wait(timeout=10)
+            mc = cc.media_controller
+            mc.play_media(media_url, "video/mp4", title=title, thumb=thumb)
+            mc.block_until_active(timeout=10)
+            return cc.name
+        finally:
+            pychromecast.discovery.stop_discovery(browser)
 
-    await asyncio.to_thread(_start)
-    return {"message": f"Casting '{title}' to {cc.name}"}
+    name = await asyncio.to_thread(_start)
+    return {"message": f"Casting '{title}' to {name}"}
 
 
 @app.post("/api/cast/control", response_class=JSONResponse)
 async def cast_control(payload: dict[str, str] = Body(...)) -> dict[str, str]:
-    uuid = payload.get("uuid", "")
+    uuid_str = payload.get("uuid", "")
     action = payload.get("action", "")
-    cc = _CAST_CACHE.get(uuid)
-    if cc is None:
-        raise HTTPException(status_code=404, detail="Cast device not found")
+    try:
+        target_uuid = UUID(uuid_str)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid device UUID")
 
-    def _run() -> None:
-        cc.wait(timeout=5)
-        mc = cc.media_controller
-        if action == "pause":
-            mc.pause()
-        elif action == "play":
-            mc.play()
-        elif action == "stop":
-            mc.stop()
+    def _run() -> str:
+        casts, browser = pychromecast.get_listed_chromecasts(uuids=[target_uuid], discovery_timeout=5)
+        try:
+            if not casts:
+                raise HTTPException(status_code=404, detail="Cast device not found on LAN")
+            cc = casts[0]
+            cc.wait(timeout=10)
+            mc = cc.media_controller
+            if action in ("pause", "play"):
+                mc.update_status()
+                if action == "pause":
+                    mc.pause()
+                else:
+                    mc.play()
+            elif action == "stop":
+                try:
+                    mc.update_status()
+                    if mc.status.media_session_id is not None:
+                        mc.stop()
+                    else:
+                        cc.quit_app()
+                except pychromecast.error.PyChromecastError:
+                    cc.quit_app()
+            return cc.name
+        except pychromecast.error.PyChromecastError as exc:
+            raise HTTPException(status_code=502, detail=f"Cast error: {exc}")
+        finally:
+            pychromecast.discovery.stop_discovery(browser)
 
-    await asyncio.to_thread(_run)
-    return {"message": f"Sent '{action}' to {cc.name}"}
+    name = await asyncio.to_thread(_run)
+    return {"message": f"Sent '{action}' to {name}"}
 
 
 @app.get("/art/{rel_path:path}")
