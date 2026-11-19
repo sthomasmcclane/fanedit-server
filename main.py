@@ -135,6 +135,38 @@ def _find_folder_art(folder: Path) -> Optional[Path]:
     return None
 
 
+def _collect_descendant_images(dirs: list[Path], limit: int = 4) -> list[tuple[Path, Path]]:
+    """Collect up to `limit` images recursively from subdirectories (breadth-first)."""
+    queue: list[tuple[Path, Path]] = []
+    for d in dirs:
+        root = next(r for r in MEDIA_ROOTS if d == r or d.is_relative_to(r))
+        queue.append((root, d))
+
+    found: list[tuple[Path, Path]] = []
+    seen_rel: set[str] = set()
+    idx = 0
+    while idx < len(queue) and len(found) < limit:
+        root, cur = queue[idx]
+        idx += 1
+        try:
+            entries = sorted(cur.iterdir(), key=lambda p: (p.is_dir(), p.name.lower()))
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            if entry.is_file() and entry.suffix.lower() in IMAGE_EXTS:
+                rel = _rel_from(root, entry)
+                if rel not in seen_rel:
+                    seen_rel.add(rel)
+                    found.append((root, entry))
+                    if len(found) >= limit:
+                        break
+            elif entry.is_dir():
+                queue.append((root, entry))
+    return found
+
+
 def _find_video_art(root: Path, video: Path) -> Optional[Path]:
     parent = video.parent
     try:
@@ -254,6 +286,17 @@ def _page_shell(title: str, breadcrumbs_html: str, body_html: str) -> str:
       object-fit: cover;
       display: block;
     }}
+    .collage {{
+      display: grid;
+      width: 100%;
+      height: 100%;
+      gap: 2px;
+      background: var(--bg);
+    }}
+    .collage.n2 {{ grid-template-columns: 1fr 1fr; }}
+    .collage.n3 {{ grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }}
+    .collage.n3 img:first-child {{ grid-row: span 2; }}
+    .collage.n4 {{ grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }}
     .placeholder {{
       padding: 1rem;
       text-align: center;
@@ -395,7 +438,7 @@ def browse(rel_path: str) -> HTMLResponse:
     clean = _safe_rel(rel_path)
     dirs = _resolve_dirs(clean)
 
-    merged_dirs: dict[str, tuple[Path, Path]] = {}
+    merged_dirs: dict[str, list[tuple[Path, Path]]] = {}
     videos: list[tuple[Path, Path]] = []
 
     for folder in dirs:
@@ -404,22 +447,48 @@ def browse(rel_path: str) -> HTMLResponse:
             if entry.name.startswith("."):
                 continue
             if entry.is_dir():
-                merged_dirs.setdefault(entry.name, (root, entry))
+                merged_dirs.setdefault(entry.name, []).append((root, entry))
             elif entry.is_file() and entry.suffix.lower() in VIDEO_EXTS:
                 videos.append((root, entry))
 
     cards: list[str] = []
     for name in sorted(merged_dirs, key=str.lower):
-        root, entry = merged_dirs[name]
-        art = _find_folder_art(entry)
-        art_html = (
-            f'<img src="/art/{_url_path(_rel_from(root, art))}" alt="" loading="lazy">'
-            if art
-            else f'<div class="placeholder">{html.escape(name)}</div>'
-        )
-        nfo = _parse_nfo(entry / "tvshow.nfo")
-        if not nfo.title:
-            nfo = _parse_nfo(entry / "folder.nfo")
+        dir_pairs = merged_dirs[name]
+        root, entry = dir_pairs[0]
+        art: Optional[Path] = None
+        art_root = root
+        for r, d in dir_pairs:
+            candidate = _find_folder_art(d)
+            if candidate is not None:
+                art = candidate
+                art_root = r
+                break
+
+        if art is not None:
+            art_html = f'<img src="/art/{_url_path(_rel_from(art_root, art))}" alt="" loading="lazy">'
+        else:
+            thumbs = _collect_descendant_images([d for _, d in dir_pairs], limit=4)
+            if len(thumbs) == 1:
+                tr, tp = thumbs[0]
+                art_html = f'<img src="/art/{_url_path(_rel_from(tr, tp))}" alt="" loading="lazy">'
+            elif len(thumbs) >= 2:
+                imgs = "".join(
+                    f'<img src="/art/{_url_path(_rel_from(tr, tp))}" alt="" loading="lazy">'
+                    for tr, tp in thumbs
+                )
+                art_html = f'<div class="collage n{len(thumbs)}">{imgs}</div>'
+            else:
+                art_html = f'<div class="placeholder">{html.escape(name)}</div>'
+
+        nfo: Optional[NfoMeta] = None
+        for _, d in dir_pairs:
+            parsed = _parse_nfo(d / "tvshow.nfo")
+            if not parsed.title:
+                parsed = _parse_nfo(d / "folder.nfo")
+            if parsed.title or parsed.plot or parsed.year:
+                nfo = parsed
+                break
+        nfo = nfo or NfoMeta()
         title = nfo.title or name
         sub = nfo.year or "Folder"
         rel_entry = _rel_from(root, entry)
