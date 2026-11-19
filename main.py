@@ -92,7 +92,9 @@ def _find_folder_art(folder: Path) -> Optional[Path]:
     if not images:
         return None
 
-    video_stems = {p.stem.lower() for p in entries if p.is_file() and p.suffix.lower() in VIDEO_EXTS}
+    videos = [p for p in entries if p.is_file() and p.suffix.lower() in VIDEO_EXTS]
+    video_stems = {p.stem.lower() for p in videos}
+    video_norms = {_norm(p.stem) for p in videos}
     folder_norm = _norm(folder.name)
 
     # 1. Exact folder name or standard poster/folder/cover names
@@ -108,10 +110,10 @@ def _find_folder_art(folder: Path) -> Optional[Path]:
 
     # 3. Unclaimed image (not matching any video in this folder)
     for img in images:
-        if img.stem.lower() not in video_stems:
+        if img.stem.lower() not in video_stems and _norm(img.stem) not in video_norms:
             return img
 
-    return images[0]
+    return None
 
 
 def _find_video_art(video: Path) -> Optional[Path]:
@@ -131,7 +133,10 @@ def _find_video_art(video: Path) -> Optional[Path]:
         if _norm(img.stem) == vid_norm:
             return img
 
-    return _find_folder_art(parent)
+    # Inherit folder/season art for subdirectories (e.g. Season 1), but not at root
+    if parent != MEDIA_ROOT:
+        return _find_folder_art(parent)
+    return None
 
 
 def _page_shell(title: str, breadcrumbs_html: str, body_html: str) -> str:
