@@ -25,7 +25,6 @@ BROWSER_PLAYABLE_EXTS = {".mp4", ".m4v", ".webm", ".mkv"}
 LAN_HOST = os.environ.get("LAN_HOST", "192.168.1.10")
 
 app = FastAPI(title="FanMedia")
-_CAST_CACHE: dict[str, Any] = {}
 
 
 @dataclass
@@ -697,14 +696,19 @@ async def transcode(rel_path: str) -> StreamingResponse:
 
 def _discover_casts() -> list[dict[str, str]]:
     chromecasts, browser = pychromecast.get_chromecasts(timeout=3)
-    pychromecast.discovery.stop_discovery(browser)
-    _CAST_CACHE.clear()
-    out: list[dict[str, str]] = []
-    for cc in chromecasts:
-        uid = str(cc.uuid)
-        _CAST_CACHE[uid] = cc
-        out.append({"uuid": uid, "name": cc.name, "model": cc.model_name})
-    return sorted(out, key=lambda d: d["name"].lower())
+    try:
+        out = [
+            {"uuid": str(cc.uuid), "name": cc.name, "model": cc.model_name}
+            for cc in chromecasts
+        ]
+        return sorted(out, key=lambda d: d["name"].lower())
+    finally:
+        for cc in chromecasts:
+            try:
+                cc.disconnect(timeout=1)
+            except Exception:
+                pass
+        pychromecast.discovery.stop_discovery(browser)
 
 
 def _lan_base(request: Request) -> str:
@@ -747,17 +751,23 @@ async def cast_play(request: Request, payload: dict[str, str] = Body(...)) -> di
 
     def _start() -> str:
         casts, browser = pychromecast.get_listed_chromecasts(uuids=[target_uuid], discovery_timeout=5)
+        cc = casts[0] if casts else None
         try:
-            if not casts:
+            if cc is None:
                 raise HTTPException(status_code=404, detail="Cast device not found on LAN")
-            cc = casts[0]
-            _CAST_CACHE[uuid_str] = cc
             cc.wait(timeout=10)
             mc = cc.media_controller
             mc.play_media(media_url, "video/mp4", title=title, thumb=thumb)
             mc.block_until_active(timeout=10)
             return cc.name
+        except pychromecast.error.PyChromecastError as exc:
+            raise HTTPException(status_code=502, detail=f"Cast error: {exc}")
         finally:
+            if cc is not None:
+                try:
+                    cc.disconnect(timeout=2)
+                except Exception:
+                    pass
             pychromecast.discovery.stop_discovery(browser)
 
     name = await asyncio.to_thread(_start)
@@ -775,10 +785,10 @@ async def cast_control(payload: dict[str, str] = Body(...)) -> dict[str, str]:
 
     def _run() -> str:
         casts, browser = pychromecast.get_listed_chromecasts(uuids=[target_uuid], discovery_timeout=5)
+        cc = casts[0] if casts else None
         try:
-            if not casts:
+            if cc is None:
                 raise HTTPException(status_code=404, detail="Cast device not found on LAN")
-            cc = casts[0]
             cc.wait(timeout=10)
             mc = cc.media_controller
             if action in ("pause", "play"):
@@ -800,6 +810,11 @@ async def cast_control(payload: dict[str, str] = Body(...)) -> dict[str, str]:
         except pychromecast.error.PyChromecastError as exc:
             raise HTTPException(status_code=502, detail=f"Cast error: {exc}")
         finally:
+            if cc is not None:
+                try:
+                    cc.disconnect(timeout=2)
+                except Exception:
+                    pass
             pychromecast.discovery.stop_discovery(browser)
 
     name = await asyncio.to_thread(_run)
